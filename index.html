@@ -12,11 +12,20 @@
     box-shadow:0 0 80px rgba(0,0,0,.9);}
   #tip{position:fixed;left:0;right:0;bottom:6px;text-align:center;color:#3a4a3a;
     font-size:11px;letter-spacing:.18em;pointer-events:none;user-select:none;}
+  #dl{position:fixed;right:16px;bottom:28px;font-size:12px;letter-spacing:.06em;}
+  #dl a{color:#8a7a3a;text-decoration:none;padding-bottom:2px;
+    border-bottom:1px solid rgba(138,122,58,.45);
+    transition:color .25s,border-color .25s;}
+  #dl a:hover{color:#ffd76a;border-color:#ffd76a;}
+  #dl,#tip{opacity:0;animation:fadein 1.2s ease 2.4s forwards;}
+  @keyframes fadein{to{opacity:1}}
+  body.rec #dl,body.rec #tip{display:none;}
 </style>
 </head>
 <body>
 <div id="wrap"><canvas id="stage"></canvas></div>
 <div id="tip">空格 / 点击 = 暂停 · 拖动可看进度</div>
+<div id="dl"><a href="ascii-xmas-tree.mp4" download>下载 20 秒成片 MP4（1080×1920）↓</a></div>
 
 <script>
 /* ==================================================================
@@ -766,6 +775,7 @@ function boot() {
 
   const params = new URLSearchParams(location.search);
   const isRecord = params.has('record');
+  if (isRecord || params.has('still')) document.body.classList.add('rec');
   window.__FPS = 30;
   window.__DURATION = CONFIG.time.duration;
   window.__renderAt = function (t) { renderAt(t); };
@@ -795,11 +805,38 @@ function boot() {
   }
   if (params.has('still')) { renderAt(parseFloat(params.get('still')) || 0); window.__ready = true; return; }
 
-  /* 正常播放 */
-  const t0 = performance.now();
+  /* 正常播放 + 交互：点击/空格 暂停，左右拖动 拖动进度 */
+  let t0 = performance.now();
   let paused = false, manualT = 0;
-  document.addEventListener('click', () => { paused = !paused; if (!paused) t0; });
-  document.addEventListener('keydown', e => { if (e.code === 'Space') { e.preventDefault(); paused = !paused; } });
+  let dragging = false, dragX = 0, moved = 0;
+  const resume = () => { t0 = performance.now() - manualT * 1000; };
+
+  document.addEventListener('pointerdown', e => {
+    dragging = true; moved = 0; dragX = e.clientX;
+    document.body.style.cursor = 'grabbing';
+  });
+  document.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    const dx = e.clientX - dragX; dragX = e.clientX;
+    moved += Math.abs(dx);
+    paused = true;
+    manualT = (manualT + dx / Math.max(1, innerWidth) * CONFIG.time.duration
+               + CONFIG.time.duration) % CONFIG.time.duration;
+  });
+  document.addEventListener('pointerup', () => {
+    if (!dragging) return;
+    dragging = false;
+    document.body.style.cursor = '';
+    if (moved < 6) { paused = !paused; if (!paused) resume(); }   /* 轻点 = 暂停/继续 */
+  });
+  document.addEventListener('pointercancel', () => {
+    dragging = false; document.body.style.cursor = '';
+  });
+  document.addEventListener('keydown', e => {
+    if (e.code === 'Space') {
+      e.preventDefault(); paused = !paused; if (!paused) resume();
+    }
+  });
 
   (function loop(now) {
     const t = paused ? manualT : ((now - t0) / 1000) % CONFIG.time.duration;
