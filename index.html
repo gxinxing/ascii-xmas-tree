@@ -1,0 +1,821 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>3D ASCII 圣诞树 · Merry Christmas</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;
+    font-family:-apple-system,"PingFang SC","Helvetica Neue",Arial,sans-serif;}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;}
+  #stage{display:block;background:#000;image-rendering:auto;
+    box-shadow:0 0 80px rgba(0,0,0,.9);}
+  #tip{position:fixed;left:0;right:0;bottom:6px;text-align:center;color:#3a4a3a;
+    font-size:11px;letter-spacing:.18em;pointer-events:none;user-select:none;}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="stage"></canvas></div>
+<div id="tip">空格 / 点击 = 暂停 · 拖动可看进度</div>
+
+<script>
+/* ==================================================================
+   3D ASCII 圣诞树  —— 单文件可编辑版
+   ------------------------------------------------------------------
+   整棵树、星星、礼物、树干、树根、飘雪全部由 ASCII 字母和符号组成，
+   每个字符都是三维空间里的一个点，有法线、受光照、参与 z-buffer 遮挡，
+   所以转动时前面亮、侧面灰、背面暗 —— 这就是「层次」。
+   ------------------------------------------------------------------
+   想改效果，只动下面的 CONFIG 数字即可，刷新页面就生效。
+   ================================================================== */
+
+const CONFIG = {
+
+  /* ---- 画布与字符网格 ---- */
+  canvas:  { w: 1080, h: 1920 },      // 竖屏 9:16
+  grid:    { cols: 100 },             // ASCII 列数（行数自动按等宽字符比例算）
+  font:    'Menlo, "Courier New", monospace',
+
+  /* ---- 时间轴（秒） ---- */
+  time: {
+    duration:      20,                // 成片时长
+    fadeIn:        1.1,               // 整体淡入
+    growStart:     1.6, growDur: 2.0, // 树从下往上生长
+    bandStart:     3.2, bandDur: 2.2, // 金色螺旋灯带点亮
+    giftStart:     4.8, giftDur: 1.7, // 礼物升起
+    greetStart:   16.2, greetDur: 2.2,// 圣诞祝福浮现
+    spinFrom:      1.0, spinTo: 18.2, // 旋转起止
+    spinTurns:     2.3                // 旋转圈数
+  },
+
+  /* ---- 圣诞树 ---- */
+  tree: {
+    height: 5.60, radius: 2.05,       // 圆锥：底半径 2.05，高 5.60
+    rings: 74, perRing: 210,          // 环数 / 每环点数
+    ridges: 9,                        // 枝条起伏的瓣数
+    hueTop: 68, hueBottom: 158,       // 顶部嫩黄绿 → 底部深青绿
+    sat: 90, lightMin: 18, lightMax: 94
+  },
+
+  /* ---- 金色螺旋灯带 ---- */
+  band: {
+    turns: 7, points: 1500,           // 缠绕圈数 / 采样点数
+    hue: 45, sat: 100, lightMin: 45, lightMax: 96,
+    lift: 0.075                       // 浮在树面外侧的距离
+  },
+
+  /* ---- 树顶星星（五角星，有厚度） ---- */
+  star: {
+    y: 6.44, outer: 0.94, inner: 0.39, thick: 0.28,
+    hue: 48, sat: 100, lightMin: 55, lightMax: 100
+  },
+
+  /* ---- 礼物盒（立体、有金色丝带） ---- */
+  gifts: [
+    { a:-0.58, r:2.42, s:0.80, h:0.62, hue:352, sat:82 },
+    { a: 0.56, r:2.58, s:0.62, h:0.74, hue: 44, sat:92 },
+    { a:-1.34, r:2.30, s:0.68, h:0.56, hue:206, sat:84 },
+    { a: 1.46, r:2.22, s:0.58, h:0.62, hue:148, sat:74 },
+    { a: 0.04, r:3.18, s:0.74, h:0.58, hue:282, sat:70 }
+  ],
+
+  /* ---- 树干 / 树根 ---- */
+  trunk: { yTop:0.20, yBottom:-1.05, rTop:0.34, rBottom:0.46, hue:26, sat:46 },
+  root:  { count:8, len:1.42, hue:24, sat:38 },
+
+  /* ---- 飘雪 ---- */
+  snow: { count:820, spanX:4.2, spanZ:2.6, yTop:8.2, yBottom:-1.15, speed:1.15 },
+
+  /* ---- 彩球 / 金光 ---- */
+  ornament: { count:120 },
+  sparkle:  { count:70 },
+
+  /* ---- 辉光强度 ---- */
+  bloom: { strong:13, strongA:0.95, soft:2.6, softA:0.16 },
+
+  /* ---- 镜头（世界单位 → 像素） ---- */
+  cam: { scale:178, lookY:2.32, dist:12 },
+
+  /* ---- 祝福语 ---- */
+  greet: {
+    en: 'MERRY CHRISTMAS',
+    cn: '圣 诞 快 乐',
+    rule: 1622, enY: 1706, cnY: 1800
+  }
+};
+
+/* ============================ 小工具 ============================ */
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const lerp  = (a, b, t) => a + (b - a) * t;
+const smooth = t => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
+const easeOutBack = t => { t = clamp(t,0,1); const c1=1.70158, c3=c1+1;
+  return 1 + c3*Math.pow(t-1,3) + c1*Math.pow(t-1,2); };
+
+/* 固定种子随机数：保证每次渲染完全一致（录制可复现） */
+function makeRng(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+/* 颜色查找表：把「亮度 0~1」量化成 32 档颜色字符串，避免每帧拼字符串 */
+function makeLUT(hue, sat, lMin, lMax, n) {
+  n = n || 32;
+  const arr = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const t = i / (n - 1);
+    const l = lerp(lMin, lMax, Math.pow(t, 0.9));
+    arr[i] = 'hsl(' + hue + ',' + sat + '%,' + l.toFixed(1) + '%)';
+  }
+  return arr;
+}
+/* 树是多色渐变，亮度之外还要按高度换色相 */
+function makeTreeLUT(hueTop, hueBottom, sat, lMin, lMax, n) {
+  n = n || 32;
+  const arr = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const t = i / (n - 1);
+    const l = lerp(lMin, lMax, Math.pow(t, 0.9));
+    arr[i] = new Array(8);
+    for (let k = 0; k < 8; k++) {                 // 高度分 8 段，过渡更细
+      const h = lerp(hueBottom, hueTop, k / 7);
+      arr[i][k] = 'hsl(' + h.toFixed(0) + ',' + sat + '%,' + l.toFixed(1) + '%)';
+    }
+  }
+  return arr;
+}
+
+/* ============================ 字符集 ============================ */
+/* 从「轻」到「重」排列：越亮的点用越密的字符，这就是 ASCII 明暗 */
+const RAMP_FULL = ' .\'`^",:;Il!i><~+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$';
+const RAMP = {
+  tree:   RAMP_FULL,
+  band:   ' .:+*xoO0X@8%$',
+  star:   ' .+*xoOX@8%$',
+  gift:   ' .;:+*xok#%8@$',
+  trunk:  ' .:-=+*#%',
+  root:   ' .:;~=+*#',
+  snow:   ' .\'+*o',
+  orn:    ' .+*oO0@',
+  spark:  ' .+*x'
+};
+function pickChar(group, b) {
+  const s = RAMP[group] || RAMP_FULL;
+  let i = Math.floor(Math.pow(b, 0.92) * (s.length - 1) + 0.0001);
+  if (i < 0) i = 0; if (i >= s.length) i = s.length - 1;
+  return s[i];
+}
+
+/* ============================ 场景构建 ============================ */
+/* 每个点：位置 xyz + 法线 nxyz + 分组 + 额外参数 */
+const P = [];
+function add(x, y, z, nx, ny, nz, g, em, ph, e0, e1) {
+  P.push({ x:x, y:y, z:z, nx:nx, ny:ny, nz:nz, g:g, em:em||0, ph:ph||0, e0:e0||0, e1:e1||0 });
+}
+
+function buildScene() {
+  const rnd = makeRng(20261225);
+  const T = CONFIG.tree, H = T.height, R = T.radius;
+  const coneSlope = R / H;                       // 圆锥母线斜率
+
+  /* ---------- 1. 树冠 ---------- */
+  for (let i = 0; i <= T.rings; i++) {
+    const t = i / T.rings;                       // 0 = 底, 1 = 顶
+    const y = H * t;
+    const r = R * (1 - t);
+    if (r < 0.015) continue;
+    const n = Math.max(8, Math.round(T.perRing * (0.42 + 0.58 * (1 - t))));
+    for (let j = 0; j < n; j++) {
+      const th = (j / n) * TAU + (rnd() - 0.5) * 0.09;
+      /* 枝条起伏：半径按角度做锯齿，形成一层层针叶 */
+      const ridge = 0.90 + 0.19 * Math.sin(th * T.ridges + t * 26.0);
+      const rr = r * ridge * (0.94 + 0.13 * rnd());
+      const yy = y + (rnd() - 0.5) * (H / T.rings) * 1.3;
+      const ct = Math.cos(th), st = Math.sin(th);
+      /* 圆锥外法线（带枝条扰动） */
+      let nx = ct, ny = coneSlope, nz = st;
+      const m = Math.hypot(nx, ny, nz);
+      nx /= m; ny /= m; nz /= m;
+      add(rr * ct, yy, rr * st, nx, ny, nz, 'tree', 0, 0, t, rnd());
+    }
+  }
+
+  /* ---------- 2. 金色螺旋灯带 ---------- */
+  const B = CONFIG.band;
+  for (let i = 0; i < B.points; i++) {
+    const t = i / (B.points - 1);                // 0 = 顶, 1 = 底
+    const th = t * B.turns * TAU;
+    const y = H * (1 - t) * 0.995;
+    const r = R * t + B.lift;
+    const ct = Math.cos(th), st = Math.sin(th);
+    /* 灯带自身有一点点厚度：沿 y 方向铺 3 个点 */
+    for (let k = -1; k <= 1; k++) {
+      const dy = k * 0.035;
+      add(r * ct, y + dy, r * st,
+          ct * 0.35, 1, st * 0.35, 'band', 1, t, t, k);
+    }
+  }
+
+  /* ---------- 3. 树顶五角星（拉伸成有厚度） ---------- */
+  const S = CONFIG.star;
+  const outer = [], inner = [];
+  for (let i = 0; i < 5; i++) {
+    const a1 = -Math.PI / 2 + i * TAU / 5;
+    const a2 = a1 + TAU / 10;
+    outer.push([Math.cos(a1) * S.outer, Math.sin(a1) * S.outer]);
+    inner.push([Math.cos(a2) * S.inner, Math.sin(a2) * S.inner]);
+  }
+  const poly = [];
+  for (let i = 0; i < 5; i++) { poly.push(outer[i]); poly.push(inner[i]); }
+  /* 前后面 + 侧面，都用「三角形重心采样」铺点 */
+  function triFill(p0, p1, p2, z, nz, cnt) {
+    for (let k = 0; k < cnt; k++) {
+      let u = rnd(), v = rnd();
+      if (u + v > 1) { u = 1 - u; v = 1 - v; }
+      const x = p0[0] + (p1[0] - p0[0]) * u + (p2[0] - p0[0]) * v;   /* 三角形内均匀采样 */
+      const y = p0[1] + (p1[1] - p0[1]) * u + (p2[1] - p0[1]) * v;
+      add(x, S.y + y, z, 0, 0, nz, 'star', 1, 0);
+    }
+  }
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i], b = poly[(i + 1) % poly.length];
+    triFill([0, 0], a, b,  S.thick / 2,  1, 26);   // 前面
+    triFill([0, 0], a, b, -S.thick / 2, -1, 20);   // 后面
+    /* 侧壁 */
+    const seg = 10;
+    for (let k = 0; k < seg; k++) {
+      const s0 = k / seg, s1 = (k + 1) / seg;
+      const q0 = [lerp(a[0], b[0], s0), lerp(a[1], b[1], s0)];
+      const q1 = [lerp(a[0], b[0], s1), lerp(a[1], b[1], s1)];
+      const mz = S.thick / 2;
+      for (let k2 = 0; k2 < 5; k2++) {
+        const u = rnd(), v = rnd();
+        const x = q0[0] + (q1[0] - q0[0]) * u;
+        const y = q0[1] + (q1[1] - q0[1]) * u;
+        const z = lerp(mz, -mz, v);
+        const m = Math.hypot(x, y) || 1;
+        add(x, S.y + y, z, x / m * 0.8, y / m * 0.8, 0.55, 'star', 1, 0);
+      }
+    }
+  }
+
+  /* ---------- 4. 树干 ---------- */
+  const K = CONFIG.trunk;
+  const kH = K.yTop - K.yBottom, kRings = 26, kPer = 30;
+  for (let i = 0; i <= kRings; i++) {
+    const t = i / kRings;                        // 0 = 下, 1 = 上
+    const y = K.yBottom + kH * t;
+    const r = lerp(K.rBottom, K.rTop, t);
+    for (let j = 0; j < kPer; j++) {
+      const th = (j / kPer) * TAU;
+      const ct = Math.cos(th), st = Math.sin(th);
+      const bark = 1 + 0.07 * Math.sin(th * 5 + t * 9);
+      add(r * bark * ct, y, r * bark * st, ct, 0.12, st, 'trunk', 0, 0, t);
+    }
+  }
+
+  /* ---------- 5. 树根（明显、向外张开） ---------- */
+  const RT = CONFIG.root;
+  for (let i = 0; i < RT.count; i++) {
+    const a0 = (i / RT.count) * TAU + rnd() * 0.25;
+    const len = RT.len * (0.72 + 0.55 * rnd());
+    const steps = 30;
+    for (let s = 0; s <= steps; s++) {
+      const u = s / steps;
+      /* 先向下、再向外摊平，形成板根 */
+      const rr = 0.30 + len * Math.pow(u, 0.72);
+      const yy = K.yBottom + 0.16 * (1 - Math.pow(u, 0.6)) - 0.34 * Math.pow(u, 1.7);
+      const rr2 = rr * (0.94 + 0.12 * rnd());
+      const ct = Math.cos(a0), st = Math.sin(a0);
+      const rad = 0.20 * (1 - u) + 0.035;
+      for (let k = 0; k < 7; k++) {
+        const th2 = (k / 7) * TAU;
+        const ox = Math.cos(th2) * rad, oy = Math.sin(th2) * rad;
+        add(rr2 * ct + ox * ct, yy + oy, rr2 * st + ox * st,
+            ct, 0.25, st, 'root', 0, 0, u);
+      }
+    }
+  }
+
+  /* ---------- 6. 礼物盒 ---------- */
+  const G = CONFIG.gifts;
+  for (let gi = 0; gi < G.length; gi++) {
+    const g = G[gi];
+    const cx = Math.sin(g.a) * g.r, cz = Math.cos(g.a) * g.r;
+    const cy = -1.05 + g.h / 2;
+    addBox(cx, cy, cz, g.s, g.h, g.s * (0.86 + 0.3 * rnd()), gi, g.hue, g.sat, rnd);
+  }
+
+  /* ---------- 7. 彩球（树上高饱和色点） ---------- */
+  const ornHues = [0, 45, 195, 320, 275, 15];
+  for (let i = 0; i < CONFIG.ornament.count; i++) {
+    const t = Math.pow(rnd(), 0.75);             // 底部更密
+    const th = rnd() * TAU;
+    const r = R * (1 - t) * (1.03 + 0.05 * rnd());
+    const y = H * t;
+    const ct = Math.cos(th), st = Math.sin(th);
+    const hue = ornHues[Math.floor(rnd() * ornHues.length)];
+    add(r * ct, y, r * st, ct, 0.4, st, 'orn', 1, rnd() * TAU, hue);
+  }
+
+  /* ---------- 8. 礼物周围的金光粒子 ---------- */
+  for (let i = 0; i < CONFIG.sparkle.count; i++) {
+    const g = G[Math.floor(rnd() * G.length)];
+    const a = g.a + (rnd() - 0.5) * 0.9;
+    const rr = g.r + (rnd() - 0.5) * 0.8;
+    add(Math.sin(a) * rr, -1.05 + rnd() * 1.5, Math.cos(a) * rr,
+        0, 0.4, 1, 'spark', 1, rnd() * TAU);
+  }
+
+  /* ---------- 9. 飘雪 ---------- */
+  const SN = CONFIG.snow;
+  for (let i = 0; i < SN.count; i++) {
+    add((rnd() - 0.5) * 2 * SN.spanX,
+        SN.yBottom + rnd() * (SN.yTop - SN.yBottom),
+        (rnd() * 0.80 - 0.28) * 2 * SN.spanZ,
+        0, 0, 1, 'snow', 0, rnd(),
+        0.32 + rnd() * 0.9,     // e0: 下落速度系数
+        rnd() * TAU);           // e1: 摆动相位
+  }
+}
+
+/* 立体礼物盒：六个面铺点 + 金色丝带 + 蝴蝶结 */
+function addBox(cx, cy, cz, sx, sy, sz, gi, hue, sat, rnd) {
+  const hx = sx / 2, hy = sy / 2, hz = sz / 2;
+  const faces = [
+    { o:[ 0, 0, hz], u:[1,0,0], v:[0,1,0], w:sx, h:sy, n:[0,0,1] },
+    { o:[ 0, 0,-hz], u:[1,0,0], v:[0,1,0], w:sx, h:sy, n:[0,0,-1] },
+    { o:[ hx, 0, 0], u:[0,0,1], v:[0,1,0], w:sz, h:sy, n:[1,0,0] },
+    { o:[-hx, 0, 0], u:[0,0,1], v:[0,1,0], w:sz, h:sy, n:[-1,0,0] },
+    { o:[ 0, hy, 0], u:[1,0,0], v:[0,0,1], w:sx, h:sz, n:[0,1,0] },
+    { o:[ 0,-hy, 0], u:[1,0,0], v:[0,0,1], w:sx, h:sz, n:[0,-1,0] }
+  ];
+  for (const f of faces) {
+    const nu = Math.max(4, Math.round(f.w * 17)), nv = Math.max(4, Math.round(f.h * 17));
+    for (let i = 0; i <= nu; i++) {
+      for (let j = 0; j <= nv; j++) {
+        const uu = (i / nu - 0.5) * f.w + (rnd() - 0.5) * 0.012;
+        const vv = (j / nv - 0.5) * f.h + (rnd() - 0.5) * 0.012;
+        const x = cx + f.o[0] + f.u[0] * uu + f.v[0] * vv;
+        const y = cy + f.o[1] + f.u[1] * uu + f.v[1] * vv;
+        const z = cz + f.o[2] + f.u[2] * uu + f.v[2] * vv;
+        /* 金色丝带：盒子正中十字交叉的那一条 */
+        const ribbon = (Math.abs(uu) < 0.075 || Math.abs(vv) < 0.075) ? 1 : 0;
+        const grp = ribbon ? 'band' : 'gift';
+        if (ribbon) add(x, y, z, f.n[0], f.n[1], f.n[2], 'band', 1, 0);
+        else        add(x, y, z, f.n[0], f.n[1], f.n[2], 'gift', 0, gi, hue, sat);
+      }
+    }
+  }
+  /* 蝴蝶结：顶面两个环 */
+  const bowY = cy + hy + 0.005;
+  for (let s = 0; s < 2; s++) {
+    const dir = s === 0 ? 1 : -1;
+    for (let i = 0; i <= 40; i++) {
+      const th = (i / 40) * TAU;
+      const rr = 0.13 * (1 - Math.cos(th) * 0.35);
+      const x = cx + dir * (0.02 + rr * (0.9 + Math.cos(th) * 0.5));
+      const z = cz + rr * Math.sin(th) * 0.85;
+      add(x, bowY + 0.10 + rr * Math.sin(th) * 0.55, z,
+          0, 0.6, 0, 'band', 1, 0);
+    }
+  }
+  add(cx, bowY + 0.14, cz, 0, 1, 0, 'band', 1, 0);
+}
+
+/* ============================ 渲染器 ============================ */
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d', { alpha: false });
+
+let CW, CH, COLS, ROWS, CELLW, CELLH, FONT_SIZE, FONT_STR;
+
+/* 分层画布：背景 / ASCII 主体 / 自发光层 */
+const bgCv = document.createElement('canvas'), bgCtx = bgCv.getContext('2d');
+const asciiCv = document.createElement('canvas'), aCtx = asciiCv.getContext('2d');
+const glowCv = document.createElement('canvas'), gCtx = glowCv.getContext('2d');
+const bloomCv = document.createElement('canvas'), bCtx = bloomCv.getContext('2d');
+
+let zbuf, winbuf, briBuf;
+let bgGrad = null;
+/* 调试用：记录每个格子最终胜出的点（分组首字母 + 亮度档），正常渲染时为 null */
+let dbgCells = null;
+
+function layout() {
+  CW = CONFIG.canvas.w; CH = CONFIG.canvas.h;
+  cv.width = CW; cv.height = CH;
+  for (const c of [bgCv, asciiCv, glowCv, bloomCv]) { c.width = CW; c.height = CH; }
+  aCtx.clearRect(0, 0, CW, CH);
+  gCtx.clearRect(0, 0, CW, CH);
+
+  /* 字符网格：等宽字符宽高比约 1:2，所以 cols/rows ≈ 1.125 */
+  COLS = CONFIG.grid.cols;
+  CELLW = CW / COLS;
+  ROWS = Math.round(CH / (CELLW * 2));
+  CELLH = CH / ROWS;
+
+  /* 校准字号，让字符步进宽度正好等于 CELLW */
+  let size = 100;
+  aCtx.font = size + 'px ' + CONFIG.font;
+  const adv = aCtx.measureText('M').width || size * 0.6;
+  FONT_SIZE = size * (CELLW / adv);
+  FONT_STR = FONT_SIZE.toFixed(2) + 'px ' + CONFIG.font;
+  aCtx.font = FONT_STR; aCtx.textBaseline = 'middle'; aCtx.textAlign = 'center';
+  gCtx.font = FONT_STR; gCtx.textBaseline = 'middle'; gCtx.textAlign = 'center';
+
+  const N = COLS * ROWS;
+  zbuf = new Float32Array(N);
+  winbuf = new Int32Array(N);
+  /* briBuf 按「点」索引（不是按格子），点数要等 buildScene() 之后才知道，
+     所以这里先占位，boot() 里再按 P.length 重新分配。 */
+  briBuf = new Float32Array(0);
+  for (let i = 0; i < N; i++) zbuf[i] = 1e9;
+
+  /* 背景：深蓝黑径向渐变 + 底部地面辉光 */
+  bgGrad = bgCtx.createRadialGradient(CW * 0.5, CH * 0.36, CH * 0.03,
+                                      CW * 0.5, CH * 0.42, CH * 0.78);
+  bgGrad.addColorStop(0,    '#0b1410');
+  bgGrad.addColorStop(0.42, '#060d0c');
+  bgGrad.addColorStop(1,    '#000000');
+}
+
+/* 颜色表 */
+const LUT = {};
+function buildLUTs() {
+  const T = CONFIG.tree, B = CONFIG.band, S = CONFIG.star, K = CONFIG.trunk, RT = CONFIG.root;
+  LUT.tree = makeTreeLUT(T.hueTop, T.hueBottom, T.sat, T.lightMin, T.lightMax);
+  LUT.band = makeLUT(B.hue, B.sat, B.lightMin, B.lightMax);
+  LUT.star = makeLUT(S.hue, S.sat, S.lightMin, S.lightMax);
+  LUT.trunk = makeLUT(K.hue, K.sat, 6, 40);
+  LUT.root = makeLUT(RT.hue, RT.sat, 4, 30);
+  LUT.snow = makeLUT(200, 30, 55, 100);
+  LUT.spark = makeLUT(48, 100, 60, 100);
+  LUT.orn = {};
+  for (const h of [0, 45, 195, 320, 275, 15]) LUT.orn[h] = makeLUT(h, 90, 35, 82);
+  LUT.gift = {};
+  for (const g of CONFIG.gifts) LUT.gift[g.hue] = makeLUT(g.hue, g.sat, 10, 62);
+}
+
+/* 光源方向（世界坐标，固定在左上前方） */
+const LX = -0.46, LY = 0.74, LZ = 0.50;
+
+function colorOf(p, b) {
+  const g = p.g;
+  if (g === 'tree') {
+    let k = Math.floor(p.e0 * 8) + (p.e1 < 0.20 ? 1 : (p.e1 > 0.88 ? -1 : 0));
+    k = Math.min(7, Math.max(0, k));
+    return LUT.tree[Math.min(31, Math.max(0, (b * 31) | 0))][k];
+  }
+  if (g === 'band')  return LUT.band[Math.min(31, Math.max(0, (b * 31) | 0))];
+  if (g === 'star')  return LUT.star[Math.min(31, Math.max(0, (b * 31) | 0))];
+  if (g === 'trunk') return LUT.trunk[Math.min(31, Math.max(0, (b * 31) | 0))];
+  if (g === 'root')  return LUT.root[Math.min(31, Math.max(0, (b * 31) | 0))];
+  if (g === 'snow')  return LUT.snow[Math.min(31, Math.max(0, (b * 31) | 0))];
+  if (g === 'spark') return LUT.spark[Math.min(31, Math.max(0, (b * 31) | 0))];
+  if (g === 'orn')   return LUT.orn[p.e0][Math.min(31, Math.max(0, (b * 31) | 0))];
+  if (g === 'gift')  return LUT.gift[p.e0][Math.min(31, Math.max(0, (b * 31) | 0))];
+  return '#ffffff';
+}
+
+/* ---------- 主渲染：把场景在时刻 t 画出来 ---------- */
+function renderAt(t) {
+  const TT = CONFIG.time;
+  const CAM = CONFIG.cam;
+  const f = CAM.scale * CAM.dist;               // 焦距（像素）
+  const cosA = Math.cos(spinAngle(t)), sinA = Math.sin(spinAngle(t));
+  const grow  = easeOutBack(clamp((t - TT.growStart) / TT.growDur, 0, 1));
+  const bandP = clamp((t - TT.bandStart) / TT.bandDur, 0, 1);
+  const fade  = clamp(t / TT.fadeIn, 0, 1);
+
+  /* --- 背景 --- */
+  bgCtx.globalCompositeOperation = 'source-over';
+  bgCtx.fillStyle = '#000';
+  bgCtx.fillRect(0, 0, CW, CH);
+  bgCtx.fillStyle = bgGrad;
+  bgCtx.fillRect(0, 0, CW, CH);
+  /* 地面辉光 */
+  const gy = 960 + (CAM.lookY - (-1.05)) * CAM.scale;
+  const gg = bgCtx.createRadialGradient(CW / 2, gy, 10, CW / 2, gy, CW * 0.72);
+  gg.addColorStop(0, 'rgba(40,78,52,0.34)');
+  gg.addColorStop(0.5, 'rgba(16,34,24,0.16)');
+  gg.addColorStop(1, 'rgba(0,0,0,0)');
+  bgCtx.fillStyle = gg;
+  bgCtx.fillRect(0, 0, CW, CH);
+
+  /* --- 清空 ASCII 层与自发光层 --- */
+  aCtx.clearRect(0, 0, CW, CH);
+  gCtx.clearRect(0, 0, CW, CH);
+
+  /* --- 光栅化 --- */
+  zbuf.fill(1e9);
+  const N = COLS * ROWS;
+  const cx = CW / 2, cy = CH / 2;
+  const n = P.length;
+
+  for (let i = 0; i < n; i++) {
+    const p = P[i];
+    let x = p.x, y = p.y, z = p.z, nx = p.nx, ny = p.ny, nz = p.nz;
+
+    /* 雪：下落 + 左右摆动 */
+    if (p.g === 'snow') {
+      const span = CONFIG.snow.yTop - CONFIG.snow.yBottom;
+      let yy = p.y - (t * CONFIG.snow.speed * p.e0);
+      yy = CONFIG.snow.yBottom + ((yy - CONFIG.snow.yBottom) % span + span) % span;
+      x += Math.sin(t * 0.55 + p.e1) * 0.34;
+      z += Math.cos(t * 0.42 + p.e1 * 1.7) * 0.22;
+      y = yy;
+      briBuf[i] = 0.34 + 0.5 * (0.5 + 0.5 * Math.sin(t * 1.7 + p.e1 * 3.0));
+    } else {
+      /* 树、灯带、星星、彩球随「生长」在 y 方向拉伸 */
+      y *= grow;
+      /* 灯带按进度逐段点亮 */
+      if (p.g === 'band' && p.e0 > bandP) { briBuf[i] = -1; continue; }
+      /* 礼物升起 */
+      if (p.g === 'gift') {
+        const gi = p.ph, gg2 = easeOutBack(clamp((t - TT.giftStart - gi * 0.14) / TT.giftDur, 0, 1));
+        y = -1.05 + (p.y - (-1.05)) * gg2 + 0.02 * gg2;
+        if (gg2 <= 0.001) { briBuf[i] = -1; continue; }
+      }
+      if (p.g === 'spark') {
+        const gg2 = clamp((t - TT.giftStart) / TT.giftDur, 0, 1);
+        if (gg2 <= 0.001) { briBuf[i] = -1; continue; }
+        y = -1.05 + (p.y + 1.05) * gg2;
+      }
+    }
+
+    /* --- 绕 Y 轴旋转（树在转，礼物和雪不转） --- */
+    let rx = x, rz = z, rnx = nx, rnz = nz;
+    if (p.g !== 'snow' && p.g !== 'gift' && p.g !== 'spark') {
+      rx = x * cosA + z * sinA;
+      rz = -x * sinA + z * cosA;
+      rnx = nx * cosA + nz * sinA;
+      rnz = -nx * sinA + nz * cosA;
+    }
+
+    /* --- 透视投影 --- */
+    const dz = rz + CAM.dist;
+    if (dz < 0.4) continue;
+    const s = f / dz;
+    const sx = cx + rx * s;
+    const sy = cy - (y - CAM.lookY) * s;
+
+    const col = (sx / CELLW) | 0;
+    if (col < 0 || col >= COLS) continue;
+    const row = ((sy - CELLH * 0.5) / CELLH + 0.5) | 0;
+    if (row < 0 || row >= ROWS) continue;
+
+    const idx = row * COLS + col;
+    if (dz < zbuf[idx]) {
+      zbuf[idx] = dz;
+      winbuf[idx] = i;
+      /* 雪花的亮度在上一步已经算好，别覆盖掉 */
+      if (p.g !== 'snow') briBuf[i] = briBuf[i] === -1 ? -1 : -2;   // -2 表示「待计算亮度」
+    }
+  }
+
+  /* --- 逐格绘制 --- */
+  for (let idx = 0; idx < N; idx++) {
+    const pi = winbuf[idx];
+    if (pi === 0 && zbuf[idx] > 1e8) continue;
+    if (zbuf[idx] > 1e8) continue;
+    const p = P[pi];
+    const col = idx % COLS, row = (idx / COLS) | 0;
+    const px = col * CELLW + CELLW * 0.5;
+    const py = row * CELLH + CELLH * 0.5;
+
+    let b;
+    if (p.g === 'snow') {
+      b = briBuf[pi];
+    } else if (p.g === 'star') {
+      /* 金星：正面最亮、侧壁次之、背面最暗 —— 这就是「立体厚度」 */
+      const rnz2 = -p.nx * sinA + p.nz * cosA;
+      b = 0.58 + 0.42 * clamp(0.5 + 0.5 * rnz2, 0, 1);   // 正面 1.0 / 背面 0.58
+      b *= 0.90 + 0.10 * Math.sin(t * 3.1);       // 整体金光闪烁
+      b = clamp(b, 0.30, 1.0);
+    } else if (p.g === 'band' || p.g === 'orn' || p.g === 'spark') {
+      /* 自发光：不太受光照影响 */
+      b = 0.72 + 0.28 * 0.775;
+      const tw = p.g === 'orn'   ? (0.55 + 0.45 * Math.sin(t * 3.4 + p.ph * 7.0))
+               : p.g === 'spark' ? (0.35 + 0.65 * Math.abs(Math.sin(t * 2.6 + p.ph * 5.0)))
+               : (0.90 + 0.10 * Math.sin(t * 2.0 + p.e0 * 12.0));
+      b *= tw;
+      b = clamp(b, 0.15, 1.0);
+    } else {
+      /* 漫反射 + 朝向相机的加亮 + 背面压暗 —— 这就是转动时的层次 */
+      let rnx = p.nx, rny = p.ny, rnz = p.nz;
+      if (p.g !== 'gift' && p.g !== 'snow') {
+        rnx = p.nx * cosA + p.nz * sinA;
+        rnz = -p.nx * sinA + p.nz * cosA;
+      }
+      const lam = Math.max(0, rnx * LX + rny * LY + rnz * LZ);
+      const front = Math.max(0, rnz);            // 朝向相机 → 提亮
+      /* 环境底光 amb 保证轮廓（尤其左右两条侧边）始终能看清；
+         dif 是漫反射；fwd 让正对相机的中心最亮 → 转动时有层次。
+         每个分组给不同的底光，避免树太暗、灯带一枝独秀。 */
+      let amb = 0.22, dif = 0.70, fwd = 0.34;
+      if (p.g === 'tree')  { amb = 0.30; dif = 0.62; fwd = 0.34; }
+      if (p.g === 'gift')  { amb = 0.34; dif = 0.60; fwd = 0.30; }
+      if (p.g === 'trunk' || p.g === 'root') { amb = 0.42; dif = 0.46; fwd = 0.30; }
+      b = amb + dif * lam + fwd * front * front;
+      b = clamp(b, 0.14, 1.0);
+    }
+
+    b *= fade;
+    const ch = pickChar(p.g, b);
+    if (dbgCells) dbgCells[idx] = p.g + ':' + b.toFixed(2) + ':' + ch;
+    if (ch === ' ' || ch === '') continue;
+    const color = colorOf(p, b);
+
+    aCtx.fillStyle = color;
+    aCtx.fillText(ch, px, py);
+    if (p.em) { gCtx.fillStyle = color; gCtx.fillText(ch, px, py); }
+  }
+
+  /* --- 合成 --- */
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.drawImage(bgCv, 0, 0);
+
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.globalAlpha = 0.92;
+  ctx.drawImage(asciiCv, 0, 0);
+
+  /* 强辉光：只对自发光层做，灯带/星星/彩球会「发光」 */
+  bCtx.clearRect(0, 0, CW, CH);
+  bCtx.filter = 'blur(' + CONFIG.bloom.strong + 'px)';
+  bCtx.drawImage(glowCv, 0, 0);
+  bCtx.filter = 'none';
+  ctx.globalAlpha = CONFIG.bloom.strongA;
+  ctx.drawImage(bloomCv, 0, 0);
+
+  /* 弱辉光：整体一点点柔化，让 ASCII 更「亮」 */
+  bCtx.clearRect(0, 0, CW, CH);
+  bCtx.filter = 'blur(' + CONFIG.bloom.soft + 'px)';
+  bCtx.drawImage(asciiCv, 0, 0);
+  bCtx.filter = 'none';
+  ctx.globalAlpha = CONFIG.bloom.softA;
+  ctx.drawImage(bloomCv, 0, 0);
+
+  /* --- 祝福语 --- */
+  ctx.globalCompositeOperation = 'source-over';
+  drawGreeting(t, fade);
+  drawVignette();
+
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function spinAngle(t) {
+  const TT = CONFIG.time;
+  const u = smooth(clamp((t - TT.spinFrom) / (TT.spinTo - TT.spinFrom), 0, 1));
+  return u * TAU * TT.spinTurns;
+}
+
+/* 逐字排布，字距可控 */
+function drawTracked(g, text, cx, y, tracking) {
+  const widths = [];
+  let total = 0;
+  for (const c of text) { const w = g.measureText(c).width; widths.push(w); total += w; }
+  total += tracking * (text.length - 1);
+  let x = cx - total / 2;
+  for (let i = 0; i < text.length; i++) {
+    g.fillText(text[i], x + widths[i] / 2, y);
+    x += widths[i] + tracking;
+  }
+}
+
+function drawGreeting(t, fade) {
+  const G = CONFIG.greet, TT = CONFIG.time;
+  const p = smooth(clamp((t - TT.greetStart) / TT.greetDur, 0, 1)) * fade;
+  if (p <= 0.001) return;
+  const pulse = 0.86 + 0.14 * Math.sin(t * 1.9);
+
+  ctx.save();
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'center';
+  ctx.globalAlpha = p;
+
+  /* 金色细线 + 菱形 */
+  ctx.strokeStyle = 'rgba(255,213,74,' + (0.5 * pulse).toFixed(3) + ')';
+  ctx.lineWidth = 1.6;
+  ctx.beginPath();
+  ctx.moveTo(CW * 0.5 - 230, G.rule); ctx.lineTo(CW * 0.5 - 26, G.rule);
+  ctx.moveTo(CW * 0.5 + 26, G.rule);  ctx.lineTo(CW * 0.5 + 230, G.rule);
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(255,225,120,' + (0.9 * pulse).toFixed(3) + ')';
+  ctx.beginPath();
+  ctx.moveTo(CW * 0.5, G.rule - 9); ctx.lineTo(CW * 0.5 + 9, G.rule);
+  ctx.lineTo(CW * 0.5, G.rule + 9); ctx.lineTo(CW * 0.5 - 9, G.rule);
+  ctx.closePath(); ctx.fill();
+
+  /* MERRY CHRISTMAS */
+  ctx.font = '600 50px "Helvetica Neue", Helvetica, Arial, sans-serif';
+  ctx.shadowColor = 'rgba(255,196,60,0.95)';
+  ctx.shadowBlur = 30 * pulse;
+  const grad = ctx.createLinearGradient(0, G.enY - 30, 0, G.enY + 30);
+  grad.addColorStop(0, '#fff6cf');
+  grad.addColorStop(0.45, '#ffd54a');
+  grad.addColorStop(1, '#e39b18');
+  ctx.fillStyle = grad;
+  drawTracked(ctx, G.en, CW * 0.5, G.enY, 7);
+
+  /* 圣 诞 快 乐 */
+  ctx.font = '400 36px "PingFang SC", "Hiragino Sans GB", "Heiti SC", "Microsoft YaHei", sans-serif';
+  ctx.shadowColor = 'rgba(255,225,150,0.8)';
+  ctx.shadowBlur = 20 * pulse;
+  ctx.fillStyle = 'rgba(255,246,224,' + (0.95).toFixed(3) + ')';
+  drawTracked(ctx, G.cn, CW * 0.5, G.cnY, 10);
+
+  ctx.restore();
+}
+
+function drawVignette() {
+  ctx.save();
+  ctx.globalCompositeOperation = 'source-over';
+  const vg = ctx.createRadialGradient(CW / 2, CH * 0.44, CH * 0.30,
+                                      CW / 2, CH * 0.46, CH * 0.72);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(0,0,0,0.62)');
+  ctx.fillStyle = vg;
+  ctx.fillRect(0, 0, CW, CH);
+  ctx.restore();
+}
+
+/* ============================ 启动 ============================ */
+function fitToWindow() {
+  const w = window.innerWidth, h = window.innerHeight;
+  const s = Math.min(w / CONFIG.canvas.w, h / CONFIG.canvas.h);
+  cv.style.width  = (CONFIG.canvas.w * s) + 'px';
+  cv.style.height = (CONFIG.canvas.h * s) + 'px';
+}
+
+let __ready = false;
+function boot() {
+  buildLUTs();
+  layout();
+  buildScene();
+  /* 点建好了才知道有多少个点；briBuf 必须按点数分配，
+     否则索引越界读回 undefined → NaN → 雪会画出 "undefined" 字样 */
+  briBuf = new Float32Array(P.length);
+  fitToWindow();
+  window.addEventListener('resize', fitToWindow);
+
+  const params = new URLSearchParams(location.search);
+  const isRecord = params.has('record');
+  window.__FPS = 30;
+  window.__DURATION = CONFIG.time.duration;
+  window.__renderAt = function (t) { renderAt(t); };
+  window.__pointCount = P.length;
+  /* 调试：返回每格胜出点的「分组:亮度:字符」，用于程序化校验构图 */
+  window.__dbg = function (t) {
+    dbgCells = new Array(COLS * ROWS);
+    renderAt(t);
+    const out = [];
+    for (let r = 0; r < ROWS; r++) {
+      const row = [];
+      for (let c = 0; c < COLS; c++) {
+        const v = dbgCells[r * COLS + c];
+        row.push(v ? v : '.');
+      }
+      out.push(row.join('|'));
+    }
+    dbgCells = null;
+    return { cols: COLS, rows: ROWS, cellW: CELLW, cellH: CELLH, grid: out };
+  };
+
+  if (isRecord) {
+    document.getElementById('tip').style.display = 'none';
+    renderAt(0);
+    window.__ready = true;
+    return;
+  }
+  if (params.has('still')) { renderAt(parseFloat(params.get('still')) || 0); window.__ready = true; return; }
+
+  /* 正常播放 */
+  const t0 = performance.now();
+  let paused = false, manualT = 0;
+  document.addEventListener('click', () => { paused = !paused; if (!paused) t0; });
+  document.addEventListener('keydown', e => { if (e.code === 'Space') { e.preventDefault(); paused = !paused; } });
+
+  (function loop(now) {
+    const t = paused ? manualT : ((now - t0) / 1000) % CONFIG.time.duration;
+    manualT = t;
+    renderAt(t);
+    requestAnimationFrame(loop);
+  })(t0);
+
+  window.__ready = true;
+}
+
+if (document.fonts && document.fonts.ready) {
+  document.fonts.ready.then(boot);
+} else {
+  window.addEventListener('load', boot);
+}
+</script>
+</body>
+</html>
